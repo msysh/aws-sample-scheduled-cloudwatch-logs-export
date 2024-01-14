@@ -1,0 +1,320 @@
+import * as cdk from 'aws-cdk-lib';
+import {
+  aws_events as events,
+  aws_events_targets as targets,
+  aws_iam as iam,
+  aws_lambda as lambda,
+  aws_lambda_nodejs as lambda_nodejs,
+  aws_logs as logs,
+  aws_s3 as s3,
+  aws_stepfunctions as sfn,
+  aws_stepfunctions_tasks as tasks,
+} from 'aws-cdk-lib';
+import { Construct } from 'constructs';
+
+export class Stack extends cdk.Stack {
+  constructor(scope: Construct, id: string, props?: cdk.StackProps) {
+    super(scope, id, props);
+
+    const targetLogGroupName = '<Please specify an exporting LogGroup>';
+    const temporaryDestinationPrefix = 'temp';
+
+    const {
+      accountId,
+      region
+    } = new cdk.ScopedAws(this);
+
+    // -----------------------------
+    // LogGroup for Export target
+    // -----------------------------
+    const targetLogGroup = logs.LogGroup.fromLogGroupName(this, 'TargetLogGroup', targetLogGroupName);
+
+    // -----------------------------
+    // S3 Bucket for destination
+    // -----------------------------
+    const destinationBucket = new s3.Bucket(this, 'DestinationBucket', {
+    });
+
+    const bucketPolicy = new s3.BucketPolicy(this, 'DestinationBucketPolicy', {
+      bucket: destinationBucket,
+    });
+    bucketPolicy.document.addStatements(new iam.PolicyStatement({
+      principals: [
+        new iam.ServicePrincipal('logs.amazonaws.com'),
+      ],
+      effect: iam.Effect.ALLOW,
+      actions: [
+        's3:GetBucketAcl',
+      ],
+      resources: [
+        `${destinationBucket.bucketArn}`
+      ],
+      conditions: {
+        'StringEquals': {
+          'aws:SourceAccount': [ accountId ]
+        },
+        'ArnLike': {
+          'aws:SourceArn': [ `${targetLogGroup.logGroupArn}` ]
+        }
+      }
+    }));
+    bucketPolicy.document.addStatements(new iam.PolicyStatement({
+      principals: [
+        new iam.ServicePrincipal('logs.amazonaws.com'),
+      ],
+      effect: iam.Effect.ALLOW,
+      actions: [
+        's3:PutObject',
+      ],
+      resources: [
+        `${destinationBucket.bucketArn}/*`
+      ],
+      conditions: {
+        'StringEquals': {
+          's3:x-amz-acl': 'bucket-owner-full-control',
+          'aws:SourceAccount': [ accountId ]
+        },
+        'ArnLike': {
+          'aws:SourceArn': [ `${targetLogGroup.logGroupArn}` ]
+        }
+      }
+    }));
+
+    // -----------------------------
+    // IAM Role for Lambda function
+    // -----------------------------
+    const role = new iam.Role(this, 'PrepareLambdaRole', {
+      assumedBy: new iam.ServicePrincipal('lambda.amazonaws.com'),
+      managedPolicies: [
+        iam.ManagedPolicy.fromAwsManagedPolicyName('service-role/AWSLambdaBasicExecutionRole'),
+      ],
+    });
+
+    // -----------------------------
+    // Lambda function for Prepare
+    // -----------------------------
+    const lambdaFunction = new lambda_nodejs.NodejsFunction(this, 'PrepareLambda', {
+      entry: 'assets/functions/prepare/app.ts',
+      runtime: lambda.Runtime.NODEJS_20_X,
+      handler: 'handler',
+      awsSdkConnectionReuse: false,
+      role: role,
+      timeout: cdk.Duration.seconds(60),
+      environment: {
+        EXPORT_TARGET_BUCKET_NAME: destinationBucket.bucketName
+      },
+      logFormat: lambda.LogFormat.JSON,
+      systemLogLevel: lambda.SystemLogLevel.DEBUG,
+    });
+
+    // -----------------------------
+    // Step Functions state machine
+    // -----------------------------
+
+    const taskPrepare = new tasks.LambdaInvoke(this, 'Prepare', {
+      lambdaFunction: lambdaFunction,
+      payload: sfn.TaskInput.fromJsonPathAt('$'),
+      resultPath: '$.Prepare',
+      resultSelector: {
+        "statusCode.$": "$.StatusCode",
+        "body.$": "$.Payload"
+      },
+    });
+
+    const taskExport = new tasks.CallAwsService(this, 'CreateExportTask', {
+      service: 'cloudwatchlogs',
+      action: 'createExportTask',
+      iamResources: [
+        targetLogGroup.logGroupArn,
+      ],
+      parameters: {
+        "LogGroupName": targetLogGroup.logGroupName,
+        "Destination.$": "$.Prepare.body.destinationBucket",
+        "DestinationPrefix": temporaryDestinationPrefix,
+        "From.$": "$.Prepare.body.from",
+        "To.$": "$.Prepare.body.to",
+      },
+      resultPath: '$.CreateExportTask',
+    });
+
+    const taskWait = new sfn.Wait(this, 'WaitExportTask', {
+      time: sfn.WaitTime.duration(cdk.Duration.minutes(1)),
+    });
+
+    const taskDescribe = new tasks.CallAwsService(this, 'DescribeExportTasks', {
+      service: 'cloudwatchlogs',
+      action: 'describeExportTasks',
+      iamResources: [
+        '*',
+      ],
+      parameters: {
+        "TaskId.$": "$.CreateExportTask.TaskId",
+      },
+      resultPath: '$.DescribeExportTasks',
+    });
+
+    const taskMoveLogFiles = new sfn.CustomState(scope, 'MoveLogFiles', {
+      stateJson: {
+        "Type": "Map",
+        "Label": "MoveLogFiles",
+        "ItemReader": {
+          "Resource": "arn:aws:states:::s3:listObjectsV2",
+          "Parameters": {
+            "Bucket.$": "$.Prepare.body.destinationBucket",
+            "Prefix.$": `States.Format('{}/{}', '${temporaryDestinationPrefix}', $.CreateExportTask.TaskId)`
+          }
+        },
+        "ItemSelector": {
+          "destinationBucket.$": "$.Prepare.body.destinationBucket",
+          "destinationPrefix.$": "$.Prepare.body.destinationPrefix",
+          "value.$": "$$.Map.Item.Value"
+        },
+        "ItemProcessor": {
+          "ProcessorConfig": {
+            "Mode": "DISTRIBUTED",
+            "ExecutionType": "STANDARD"
+          },
+          "StartAt": "CopyObject",
+          "States": {
+            "CopyObject": {
+              "Type": "Task",
+              "Resource": "arn:aws:states:::aws-sdk:s3:copyObject",
+              "Parameters": {
+                "Bucket.$": "$.destinationBucket",
+                "CopySource.$": "States.Format('{}/{}', $.destinationBucket, $.value.Key)",
+                "Key.$": "States.Format('{}/{}-{}', $.destinationPrefix, States.ArrayGetItem(States.StringSplit($.value.Key, '/'), 2), States.ArrayGetItem(States.StringSplit($.value.Key, '/'), 3))"
+              },
+              "ResultPath": "$.CopyObject",
+              "Next": "DeleteObject",
+            },
+            "DeleteObject": {
+              "Type": "Task",
+              "Resource": "arn:aws:states:::aws-sdk:s3:deleteObject",
+              "Parameters": {
+                "Bucket.$": "$.destinationBucket",
+                "Key.$": "$.value.Key"
+              },
+              "ResultPath": "$.DeleteObject",
+              "End": true,
+            }
+          }
+        },
+        "MaxConcurrency": 1000,
+        "ResultPath": "$.DistributedCopy",
+        "Next": "Success",
+      }
+    });
+
+    const taskSuccess = new sfn.Succeed(this, 'Success', {});
+
+    const taskFail = new sfn.Fail(this, 'Fail', {});
+
+    const taskConfirm = new sfn.Choice(this, 'ConfirmComplete').when(
+      sfn.Condition.stringEquals('$.DescribeExportTasks.ExportTasks[0].Status.Code', 'COMPLETED'),
+      taskMoveLogFiles
+    ).when(
+      sfn.Condition.or(
+        sfn.Condition.stringEquals('$.DescribeExportTasks.ExportTasks[0].Status.Code', 'FAILED'),
+        sfn.Condition.stringEquals('$.DescribeExportTasks.ExportTasks[0].Status.Code', 'CANCELLED'),
+        sfn.Condition.stringEquals('$.DescribeExportTasks.ExportTasks[0].Status.Code', 'PENDING_CANCEL'),
+      ),
+      taskFail
+    ).otherwise(
+      taskWait
+    );
+
+    taskPrepare
+      .next(taskExport)
+      .next(taskWait)
+      .next(taskDescribe)
+      .next(taskConfirm);
+
+    taskMoveLogFiles.next(taskSuccess);
+
+    // -----------------------------
+    // IAM Role for Step Functions state machine
+    // -----------------------------
+    const stateMachineRole = new iam.Role(this, 'StateMachineRole', {
+      assumedBy: new iam.ServicePrincipal('states.amazonaws.com'),
+      inlinePolicies: {
+        'policy-for-custom-state': new iam.PolicyDocument({
+          statements: [
+            new iam.PolicyStatement({
+              effect: iam.Effect.ALLOW,
+              actions: [
+                's3:GetObject',
+                's3:PutObject',
+                's3:DeleteObject',
+              ],
+              resources: [ `${destinationBucket.bucketArn}/*` ],
+            }),
+            new iam.PolicyStatement({
+              effect: iam.Effect.ALLOW,
+              actions: [
+                's3:ListBucket',
+              ],
+              resources: ['*']
+            }),
+          ]
+        })
+      }
+    });
+
+    const stateMachine = new sfn.StateMachine(this, 'StateMachine', {
+      role: stateMachineRole,
+      definitionBody: sfn.DefinitionBody.fromChainable(
+        taskPrepare
+      ),
+    });
+
+    stateMachineRole.attachInlinePolicy(new iam.Policy(this, 'StateMachineSelfPolicy', {
+      policyName: 'policy-for-state-machine',
+      statements: [
+        new iam.PolicyStatement({
+          effect: iam.Effect.ALLOW,
+          actions: [
+            'states:StartExecution',
+          ],
+          resources: [
+            stateMachine.stateMachineArn,
+            `${stateMachine.stateMachineArn}/*`
+          ]
+        }),
+        new iam.PolicyStatement({
+          effect: iam.Effect.ALLOW,
+          actions: [
+            'states:RedriveExecution',
+          ],
+          resources: [
+            `arn:aws:states:${region}:${accountId}:mapRun:${stateMachine.stateMachineName}/*`,
+          ]
+        }),
+      ]
+    }))
+
+    // -----------------------------
+    // EventBridge Rule
+    // -----------------------------
+    new events.Rule(this, 'EventRule', {
+      ruleName: 'scheduled-cloudwatch-logs-export',
+      schedule: events.Schedule.cron({
+        minute: '0',
+        hour: '1',
+        day: '*',
+        month: '*',
+        // weekDay: '?',
+        year: '*',
+      }),
+      enabled: true,
+      targets: [new targets.SfnStateMachine(stateMachine)],
+    });
+
+    // -----------------------------
+    // Output
+    // -----------------------------
+    new cdk.CfnOutput(this, 'OutputDestinationBucket', {
+      description: 'Destination S3 Bucket',
+      value: destinationBucket.bucketName,
+    });
+  }
+}
