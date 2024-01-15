@@ -57,6 +57,17 @@ cdk deploy
 
 If you have never run `cdk` command, firstly you may need to run `cdk bootstrap`.
 
+## Debug execution
+
+> [!Tip]
+> If you want to execute Step Functions state machine for debug, you can put any timing as current date (UTC) to input parameter. Please specify in ISO 8601 format.
+
+```json
+{
+  "currentDate": "2024-01-01T01:23:45"
+}
+```
+
 ## Attention!!
 
 > [!WARNING]
