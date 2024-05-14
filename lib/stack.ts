@@ -203,7 +203,7 @@ export class Stack extends cdk.Stack {
         "ResultSelector": {
           "logFilesNum.$": "States.ArrayLength($)"
         },
-        "ResultPath": "$.DistributedCopy",
+        "ResultPath": "$.MoveLogFiles",
         "Next": "Success",
       }
     });
