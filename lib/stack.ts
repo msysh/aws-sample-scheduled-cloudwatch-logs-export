@@ -200,6 +200,9 @@ export class Stack extends cdk.Stack {
           }
         },
         "MaxConcurrency": 1000,
+        "ResultSelector": {
+          "logFilesNum.$": "States.ArrayLength($)"
+        },
         "ResultPath": "$.DistributedCopy",
         "Next": "Success",
       }
