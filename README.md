@@ -16,15 +16,15 @@ This project are provisioned by the AWS Cloud Development Kit (CDK). If you have
 
 ### 1. Specify LogGroup
 
-[Specify an exporting LogGroup in CDK code](./lib/stack.ts#L19)
+[Specify an exporting LogGroup in CDK code](./lib/stack.ts#L17)
 
 ```typescript
-const targetLogGroupName = '<Please specify an exportin LogGroup>';
+const targetLogGroupName = '<Please specify an exporting LogGroup>';
 ```
 
 ### 2. Specify execution timing
 
-[Specify an exection timing in CDK code](./lib/stack.ts#L301-#L308)
+[Specify an execution timing in CDK code](./lib/stack.ts#L293-#L300)
 
 ```typescript
 schedule: events.Schedule.cron({
@@ -47,7 +47,7 @@ schedule: events.Schedule.rate(
 
 #### (Optional)
 
-Since the parameters of `CreateExportTask`, `From` and `To`, are specified in Lambda, if necessary, please customize the [Lambda function](./assets/functions/prepare/app.ts).
+Since the parameters of `CreateExportTask`, `From` and `To`, are specified at the [Prepare state with JSONata](./lib/stack.ts#L89-L100), if necessary, please customize the it.
 
 ### 3. Deploy AWS resources
 
@@ -65,20 +65,6 @@ If you have never run `cdk` command, firstly you may need to run `cdk bootstrap`
 ```json
 {
   "currentDate": "2024-01-01T01:23:45"
-}
-```
-
-## Attention!!
-
-> [!WARNING]
-> If the log stream name contains a slash(`/`), the final log file name (after moving it) will be incorrect. Please correct the part of the [CDK code](./lib/stack.ts#L186) that does the object key for the destination.
-
-```json
-{
-  //  :
-  // (snip)
-  //  :
-  "Key.$": "States.Format('{}/{}-{}', $.destinationPrefix, States.ArrayGetItem(States.StringSplit($.value.Key, '/'), 2), States.ArrayGetItem(States.StringSplit($.value.Key, '/'), 3))"
 }
 ```
 
@@ -100,16 +86,20 @@ This sample solution moves log files into following:
 
 ```
 bucket-name
-  + yyyy
-    + MM
-      + dd
-        + <Log Stream Name>-000000.gz
+  + (Destination Prefix: if specified, default is "exported-logs")
+    + yyyy
+      + MM
+        + dd
+          + <Log Stream Name>-000000.gz
                      :
                      :
 ```
 
 > [!Tip]
-> `yyyy/MM/dd` is identified at the [papare Lambda function](./assets/functions/prepare/app.ts#L41-L46) as destination prefix. If you want to change it, please customize the function.
+> `yyyy/MM/dd` is identified at the [Prepare state with JSONata](./lib/stack.ts#L89-L100) as destination date prefix. If you want to change it, you can customize it.
+
+> [!Tip]
+> Task results for moving files are stored at `<Destination Bucket>/result-write-logs-for-moving-files/<TaskID>/*`. If you want to change the prefix, you can modify at [here](./lib/stack.ts#L20).
 
 ## Clean up
 
