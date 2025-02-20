@@ -3,8 +3,6 @@ import {
   aws_events as events,
   aws_events_targets as targets,
   aws_iam as iam,
-  aws_lambda as lambda,
-  aws_lambda_nodejs as lambda_nodejs,
   aws_logs as logs,
   aws_s3 as s3,
   aws_stepfunctions as sfn,
@@ -17,8 +15,9 @@ export class Stack extends cdk.Stack {
     super(scope, id, props);
 
     const targetLogGroupName = '<Please specify an exporting LogGroup>';
+    const destinationPrefix = 'exported-logs';
     const temporaryDestinationPrefix = 'temp';
-    const resultWriterPrefix = 'MovingFilesLogs';
+    const resultWriterPrefix = 'result-write-logs-for-moving-files';
 
     const {
       accountId,
@@ -82,44 +81,23 @@ export class Stack extends cdk.Stack {
     }));
 
     // -----------------------------
-    // IAM Role for Lambda function
-    // -----------------------------
-    const role = new iam.Role(this, 'PrepareLambdaRole', {
-      assumedBy: new iam.ServicePrincipal('lambda.amazonaws.com'),
-      managedPolicies: [
-        iam.ManagedPolicy.fromAwsManagedPolicyName('service-role/AWSLambdaBasicExecutionRole'),
-      ],
-    });
-
-    // -----------------------------
-    // Lambda function for Prepare
-    // -----------------------------
-    const lambdaFunction = new lambda_nodejs.NodejsFunction(this, 'PrepareLambda', {
-      entry: 'assets/functions/prepare/app.ts',
-      runtime: lambda.Runtime.NODEJS_22_X,
-      architecture: lambda.Architecture.ARM_64,
-      handler: 'handler',
-      awsSdkConnectionReuse: false,
-      role: role,
-      timeout: cdk.Duration.seconds(60),
-      environment: {
-        EXPORT_TARGET_BUCKET_NAME: destinationBucket.bucketName
-      },
-      loggingFormat: lambda.LoggingFormat.JSON,
-      systemLogLevelV2: lambda.SystemLogLevel.DEBUG,
-    });
-
-    // -----------------------------
     // Step Functions state machine
     // -----------------------------
 
-    const taskPrepare = new tasks.LambdaInvoke(this, 'Prepare', {
-      lambdaFunction: lambdaFunction,
-      payload: sfn.TaskInput.fromJsonPathAt('$'),
-      resultPath: '$.Prepare',
-      resultSelector: {
-        "statusCode.$": "$.StatusCode",
-        "body.$": "$.Payload"
+    const taskPrepare = new sfn.Pass(this, 'Prepare', {
+      assign: {
+        "target": `{%(
+          $yesterday := ($toMillis($now()) - 24*60*60*1000);
+          $from := $fromMillis($yesterday, '[Y0001]-[M01]-[D01]T00:00:00.000Z');
+          $to := $fromMillis($yesterday, '[Y0001]-[M01]-[D01]T23:59:59.999Z');
+          $datePrefix := $fromMillis($yesterday, '[Y0001]/[M01]/[D01]');
+
+          {
+            "from": $toMillis($from),
+            "to": $toMillis($to),
+            "datePrefix": $datePrefix
+          }
+      )%}`
       },
     });
 
@@ -131,12 +109,14 @@ export class Stack extends cdk.Stack {
       ],
       parameters: {
         "LogGroupName": targetLogGroup.logGroupName,
-        "Destination.$": "$.Prepare.body.destinationBucket",
+        "Destination": destinationBucket.bucketName,
         "DestinationPrefix": temporaryDestinationPrefix,
-        "From.$": "$.Prepare.body.from",
-        "To.$": "$.Prepare.body.to",
+        "From": "{% $target.from %}",
+        "To": "{% $target.to %}",
       },
-      resultPath: '$.CreateExportTask',
+      assign: {
+        "exportTaskId": "{% $states.result.TaskId %}",
+      }
     });
 
     const taskWait = new sfn.Wait(this, 'WaitExportTask', {
@@ -150,9 +130,11 @@ export class Stack extends cdk.Stack {
         '*',
       ],
       parameters: {
-        "TaskId.$": "$.CreateExportTask.TaskId",
+        "TaskId": "{% $exportTaskId %}",
       },
-      resultPath: '$.DescribeExportTasks',
+      assign: {
+        'exportTaskStatusCode': '{% $states.result.ExportTasks[0].Status.Code %}',
+      }
     });
 
     const taskMoveLogFiles = new sfn.CustomState(scope, 'MoveLogFiles', {
@@ -161,15 +143,16 @@ export class Stack extends cdk.Stack {
         "Label": "MoveLogFiles",
         "ItemReader": {
           "Resource": "arn:aws:states:::s3:listObjectsV2",
-          "Parameters": {
-            "Bucket.$": "$.Prepare.body.destinationBucket",
-            "Prefix.$": `States.Format('{}/{}', '${temporaryDestinationPrefix}', $.CreateExportTask.TaskId)`
+          "Arguments": {
+            "Bucket": destinationBucket.bucketName,
+            "Prefix": `{% "${temporaryDestinationPrefix}/" & $exportTaskId %}`
           }
         },
         "ItemSelector": {
-          "destinationBucket.$": "$.Prepare.body.destinationBucket",
-          "destinationPrefix.$": "$.Prepare.body.destinationPrefix",
-          "value.$": "$$.Map.Item.Value"
+          "exportTaskId": "{% $exportTaskId %}",
+          "destinationBucket": destinationBucket.bucketName,
+          "datePrefix": "{% $target.datePrefix %}",
+          "targetObject": "{% $states.context.Map.Item.Value %}"
         },
         "ItemProcessor": {
           "ProcessorConfig": {
@@ -181,22 +164,27 @@ export class Stack extends cdk.Stack {
             "CopyObject": {
               "Type": "Task",
               "Resource": "arn:aws:states:::aws-sdk:s3:copyObject",
-              "Parameters": {
-                "Bucket.$": "$.destinationBucket",
-                "CopySource.$": "States.Format('{}/{}', $.destinationBucket, $.value.Key)",
-                "Key.$": "States.Format('{}/{}-{}', $.destinationPrefix, States.ArrayGetItem(States.StringSplit($.value.Key, '/'), 2), States.ArrayGetItem(States.StringSplit($.value.Key, '/'), 3))"
+              "Arguments": {
+                "Bucket": destinationBucket.bucketName,
+                "CopySource": `{% '${destinationBucket.bucketName}/' & $states.input.targetObject.Key %}`,
+                "Key": `{%(
+                  $temp := $replace($states.input.targetObject.Key, '${temporaryDestinationPrefix}/' & $states.input.exportTaskId & '/', '');
+                  $newFileName := $replace($temp, '/', '-');
+                  '${destinationPrefix}/' & $states.input.datePrefix & '/' & $newFileName
+                )%}`
               },
-              "ResultPath": "$.CopyObject",
+              "Assign": {
+                "targetKey": "{% $states.input.targetObject.Key %}"
+              },
               "Next": "DeleteObject",
             },
             "DeleteObject": {
               "Type": "Task",
               "Resource": "arn:aws:states:::aws-sdk:s3:deleteObject",
-              "Parameters": {
-                "Bucket.$": "$.destinationBucket",
-                "Key.$": "$.value.Key"
+              "Arguments": {
+                "Bucket": destinationBucket.bucketName,
+                "Key": "{% $targetKey %}"
               },
-              "ResultPath": "$.DeleteObject",
               "End": true,
             }
           }
@@ -204,12 +192,11 @@ export class Stack extends cdk.Stack {
         "MaxConcurrency": 1000,
         "ResultWriter": {
           "Resource": "arn:aws:states:::s3:putObject",
-          "Parameters": {
+          "Arguments": {
             "Bucket": destinationBucket.bucketName,
             "Prefix": resultWriterPrefix,
           },
         },
-        "ResultPath": "$.MoveLogFiles",
         "Next": "Success",
       }
     });
@@ -219,14 +206,10 @@ export class Stack extends cdk.Stack {
     const taskFail = new sfn.Fail(this, 'Fail', {});
 
     const taskConfirm = new sfn.Choice(this, 'ConfirmComplete').when(
-      sfn.Condition.stringEquals('$.DescribeExportTasks.ExportTasks[0].Status.Code', 'COMPLETED'),
+      sfn.Condition.jsonata('{% $exportTaskStatusCode = "COMPLETED" %}'),
       taskMoveLogFiles
     ).when(
-      sfn.Condition.or(
-        sfn.Condition.stringEquals('$.DescribeExportTasks.ExportTasks[0].Status.Code', 'FAILED'),
-        sfn.Condition.stringEquals('$.DescribeExportTasks.ExportTasks[0].Status.Code', 'CANCELLED'),
-        sfn.Condition.stringEquals('$.DescribeExportTasks.ExportTasks[0].Status.Code', 'PENDING_CANCEL'),
-      ),
+      sfn.Condition.jsonata('{% $exportTaskStatusCode = "FAILED" or $exportTaskStatusCode = "CANCELLED" or $exportTaskStatusCode = "PENDING_CANCEL" %}'),
       taskFail
     ).otherwise(
       taskWait
@@ -271,6 +254,7 @@ export class Stack extends cdk.Stack {
 
     const stateMachine = new sfn.StateMachine(this, 'StateMachine', {
       role: stateMachineRole,
+      queryLanguage: sfn.QueryLanguage.JSONATA,
       definitionBody: sfn.DefinitionBody.fromChainable(
         taskPrepare
       ),
