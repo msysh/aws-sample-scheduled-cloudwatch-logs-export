@@ -18,6 +18,7 @@ export class Stack extends cdk.Stack {
 
     const targetLogGroupName = '<Please specify an exporting LogGroup>';
     const temporaryDestinationPrefix = 'temp';
+    const resultWriterPrefix = 'MovingFilesLogs';
 
     const {
       accountId,
@@ -95,7 +96,8 @@ export class Stack extends cdk.Stack {
     // -----------------------------
     const lambdaFunction = new lambda_nodejs.NodejsFunction(this, 'PrepareLambda', {
       entry: 'assets/functions/prepare/app.ts',
-      runtime: lambda.Runtime.NODEJS_20_X,
+      runtime: lambda.Runtime.NODEJS_22_X,
+      architecture: lambda.Architecture.ARM_64,
       handler: 'handler',
       awsSdkConnectionReuse: false,
       role: role,
@@ -103,8 +105,8 @@ export class Stack extends cdk.Stack {
       environment: {
         EXPORT_TARGET_BUCKET_NAME: destinationBucket.bucketName
       },
-      logFormat: lambda.LogFormat.JSON,
-      systemLogLevel: lambda.SystemLogLevel.DEBUG,
+      loggingFormat: lambda.LoggingFormat.JSON,
+      systemLogLevelV2: lambda.SystemLogLevel.DEBUG,
     });
 
     // -----------------------------
@@ -200,8 +202,12 @@ export class Stack extends cdk.Stack {
           }
         },
         "MaxConcurrency": 1000,
-        "ResultSelector": {
-          "logFilesNum.$": "States.ArrayLength($)"
+        "ResultWriter": {
+          "Resource": "arn:aws:states:::s3:putObject",
+          "Parameters": {
+            "Bucket": destinationBucket.bucketName,
+            "Prefix": resultWriterPrefix,
+          },
         },
         "ResultPath": "$.MoveLogFiles",
         "Next": "Success",
