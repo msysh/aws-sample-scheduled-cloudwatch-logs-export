@@ -8,6 +8,14 @@ The logs exported by CloudWatch Logs are stored in folders separated by task ID 
 
 ![Step Functions state machine flow](./doc/images/architecture.svg)
 
+## Important
+
+> [!IMPORTANT]
+> If you want to export CloudWatch Logs to S3 and search them with Athena, using a Subscription Filter and Firehose may provide better search performance in some cases. If the export task outputs many small files, searching with Athena can become inefficient and perform poorly. To mitigate this, if you will use AWS Glue to compact the many small files into one large file, it may be better to use Firehose from the start.
+
+> [!NOTE]
+> CloudWatch Logs charges are based on two methods: Ingestion and Storage. In fact, the Ingestion cost is dominant. While it's true that storing logs in S3 is cheaper, keeping them in CloudWatch Logs does not make a significant difference. If your requirement is simply searching with CloudWatch Logs Insights, [setting the log class to the Infrequent Access](https://docs.aws.amazon.com/AmazonCloudWatch/latest/logs/CloudWatch_Logs_Log_Classes.html) may be the best option.
+
 ## Pre-requirement
 
 This project are provisioned by the AWS Cloud Development Kit (CDK). If you have not installed the CDK, first install it by referring to the [documents](https://docs.aws.amazon.com/cdk/v2/guide/getting_started.html).
